@@ -1,0 +1,17 @@
+# 生成產物（每次跑都會長出來，不進 repo）
+backend/outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# favicon 中間檔（只保留 inline 進 HTML 的成品）
+frontend/favicon-src.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
