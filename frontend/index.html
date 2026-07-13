@@ -35,6 +35,22 @@
       background: var(--panel); border: 1px solid var(--line);
       border-radius: 14px; padding: 18px;
     }
+    .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+    .tab {
+      flex: 1; padding: 9px; text-align: center; font-size: 14px; font-weight: 600;
+      border: 1px solid var(--line); border-radius: 9px; cursor: pointer;
+      color: var(--muted); background: #14161d; transition: .15s;
+    }
+    .tab.active { color: #fff; border-color: var(--accent); background: #1b1e28; }
+    .pane { display: none; }
+    .pane.active { display: block; }
+    textarea {
+      width: 100%; min-height: 96px; resize: vertical; padding: 12px;
+      border-radius: 10px; border: 1px solid var(--line); background: #14161d;
+      color: var(--fg); font-size: 14px; font-family: inherit;
+    }
+    textarea:focus { outline: none; border-color: var(--accent); }
+    .hint { margin-top: 8px; font-size: 12px; color: var(--muted); }
     .drop {
       border: 1.5px dashed var(--line); border-radius: 12px; padding: 26px 14px;
       text-align: center; cursor: pointer; transition: .15s; color: var(--muted);
@@ -76,17 +92,31 @@
 <body>
   <header>
     <h1><span class="g">Bob 3D</span> — 圖生 3D</h1>
-    <p>上傳一張圖，用開源 TripoSR 在本機 GPU 幾秒生出可旋轉的 3D 模型</p>
+    <p>上傳一張圖，或打幾個字，用開源模型在本機 GPU 生出可旋轉的 3D 模型</p>
   </header>
 
   <div class="wrap">
     <div class="card">
-      <label class="drop" id="drop">
-        <input type="file" id="file" accept="image/*" />
-        <div id="dropText">📷 點這裡或拖一張圖進來<br /><small>建議：單一主體、背景乾淨</small></div>
-      </label>
-      <div class="preview" id="preview"></div>
-      <button id="gen" disabled>生成 3D 模型</button>
+      <div class="tabs">
+        <div class="tab active" id="tabImg" data-pane="paneImg">📷 上傳圖片</div>
+        <div class="tab" id="tabTxt" data-pane="paneTxt">⌨️ 打字生成</div>
+      </div>
+
+      <div class="pane active" id="paneImg">
+        <label class="drop" id="drop">
+          <input type="file" id="file" accept="image/*" />
+          <div id="dropText">📷 點這裡或拖一張圖進來<br /><small>建議：單一主體、背景乾淨</small></div>
+        </label>
+        <div class="preview" id="preview"></div>
+        <button id="gen" disabled>生成 3D 模型</button>
+      </div>
+
+      <div class="pane" id="paneTxt">
+        <textarea id="prompt" placeholder="用英文描述一個單一物體，例如：a cute robot toy, a red teapot, a wooden chair"></textarea>
+        <div class="hint">先用 SDXL-Turbo 生一張圖，再轉 3D。英文效果最好、描述單一主體。</div>
+        <button id="genTxt">打字生成 3D</button>
+      </div>
+
       <div class="status" id="status"></div>
     </div>
 
@@ -122,34 +152,63 @@
       $("gen").disabled = false;
     }
 
-    $("gen").addEventListener("click", async () => {
-      if (!picked) return;
-      $("gen").disabled = true;
-      $("status").innerHTML = `<span class="spin"></span> 去背 → GPU 推論 → 建網格中…`;
-      const fd = new FormData();
-      fd.append("image", picked);
+    // ---- tab 切換 ----
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+        document.querySelectorAll(".pane").forEach((p) => p.classList.remove("active"));
+        tab.classList.add("active");
+        $(tab.dataset.pane).classList.add("active");
+      });
+    });
+
+    // ---- 共用：把後端回傳的結果顯示到 model-viewer ----
+    function showResult(d) {
+      const glb = API + d.model_url;
+      const mv = $("mv");
+      mv.src = glb;
+      mv.style.display = "block";
+      $("empty").style.display = "none";
+      const t = d.timings_sec;
+      const pills = [`<span class="pill">總耗時 ${d.total_sec}s</span>`];
+      if (t.text2img != null) pills.push(`<span class="pill">生圖 ${t.text2img}s</span>`);
+      pills.push(`<span class="pill">推論 ${t.inference}s</span>`);
+      pills.push(`<span class="pill">建網格 ${t.mesh}s</span>`);
+      pills.push(`<span class="pill">job ${d.job_id}</span>`);
+      $("meta").innerHTML = pills.join("");
+      const dl = $("dl");
+      dl.href = glb; dl.style.display = "inline-block";
+      $("status").innerHTML = `✅ 完成，共 ${d.total_sec}s`;
+    }
+
+    async function runGenerate(btn, url, body, statusText) {
+      btn.disabled = true;
+      $("status").innerHTML = `<span class="spin"></span> ${statusText}`;
       try {
-        const r = await fetch(API + "/api/generate", { method: "POST", body: fd });
+        const r = await fetch(API + url, { method: "POST", body });
         if (!r.ok) throw new Error(await r.text());
-        const d = await r.json();
-        const glb = API + d.model_url;
-        const mv = $("mv");
-        mv.src = glb;
-        mv.style.display = "block";
-        $("empty").style.display = "none";
-        $("meta").innerHTML =
-          `<span class="pill">總耗時 ${d.total_sec}s</span>` +
-          `<span class="pill">推論 ${d.timings_sec.inference}s</span>` +
-          `<span class="pill">建網格 ${d.timings_sec.mesh}s</span>` +
-          `<span class="pill">job ${d.job_id}</span>`;
-        const dl = $("dl");
-        dl.href = glb; dl.style.display = "inline-block";
-        $("status").innerHTML = `✅ 完成，共 ${d.total_sec}s`;
+        showResult(await r.json());
       } catch (e) {
         $("status").innerHTML = `❌ 失敗：${e.message}`;
       } finally {
-        $("gen").disabled = false;
+        btn.disabled = false;
       }
+    }
+
+    $("gen").addEventListener("click", () => {
+      if (!picked) return;
+      const fd = new FormData();
+      fd.append("image", picked);
+      runGenerate($("gen"), "/api/generate", fd, "去背 → GPU 推論 → 建網格中…");
+    });
+
+    $("genTxt").addEventListener("click", () => {
+      const prompt = $("prompt").value.trim();
+      if (!prompt) { $("status").innerHTML = "❌ 請先輸入描述"; return; }
+      const fd = new FormData();
+      fd.append("prompt", prompt);
+      runGenerate($("genTxt"), "/api/generate-from-text", fd,
+        "SDXL 生圖 → 去背 → GPU 推論 → 建網格中…（第一次要載模型，久一點）");
     });
   </script>
 </body>

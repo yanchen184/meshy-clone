@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,10 +44,13 @@ DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MC_RESOLUTION = int(os.environ.get("MC_RESOLUTION", "256"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "8192"))
 FOREGROUND_RATIO = 0.85
+# 文生圖模型（打字生 3D 的第一段）。SDXL-Turbo：1-4 步出圖、免 CFG、fp16 塞得下。
+TXT2IMG_MODEL = os.environ.get("TXT2IMG_MODEL", "stabilityai/sdxl-turbo")
 
 # ---- 全域單例：模型與去背 session 只載一次 ----
 model: TSR | None = None
 rembg_session = None
+txt2img_pipe = None  # lazy：第一次打字生 3D 才載
 
 
 def load_engine() -> None:
@@ -64,6 +67,40 @@ def load_engine() -> None:
     model.to(DEVICE)
     rembg_session = rembg.new_session()
     log.info(f"Engine ready in {time.time() - t0:.1f}s (device={DEVICE})")
+
+
+def _load_txt2img():
+    """lazy 載入 SDXL-Turbo。第一次呼叫才下載/載入（約 7GB 權重）。"""
+    global txt2img_pipe
+    if txt2img_pipe is not None:
+        return txt2img_pipe
+    from diffusers import AutoPipelineForText2Image
+
+    t0 = time.time()
+    log.info(f"Loading {TXT2IMG_MODEL} (fp16) ...")
+    pipe = AutoPipelineForText2Image.from_pretrained(
+        TXT2IMG_MODEL, torch_dtype=torch.float16, variant="fp16"
+    )
+    txt2img_pipe = pipe
+    log.info(f"txt2img ready in {time.time() - t0:.1f}s")
+    return txt2img_pipe
+
+
+def text_to_image(prompt: str) -> Image.Image:
+    """文字 → 一張圖。SDXL-Turbo 用完把權重移回 CPU、清 GPU，
+    把 VRAM 讓回給常駐的 TripoSR（12GB 卡塞不下兩個模型同時在 GPU）。"""
+    pipe = _load_txt2img()
+    pipe.to(DEVICE)
+    try:
+        # SDXL-Turbo 設計：num_inference_steps=1、guidance_scale=0.0（免 CFG）
+        img = pipe(
+            prompt=prompt, num_inference_steps=1, guidance_scale=0.0
+        ).images[0]
+    finally:
+        pipe.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return img.convert("RGB")
 
 
 app = FastAPI(title="meshy-clone", version="0.1.0")
@@ -90,25 +127,9 @@ def health() -> dict:
     }
 
 
-@app.post("/api/generate")
-async def generate(
-    image: UploadFile = File(...),
-    remove_bg: bool = True,
-) -> JSONResponse:
-    """收一張圖，回傳生成好的 .glb 相對 URL 與耗時。"""
-    if model is None:
-        raise HTTPException(503, "engine still loading, retry shortly")
-
-    try:
-        raw = await image.read()
-        pil = Image.open(io.BytesIO(raw))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"cannot read image: {e}")
-
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = OUTPUT_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
+def image_to_glb(pil: Image.Image, job_dir: Path, remove_bg: bool = True) -> dict:
+    """圖 → glb 的共用核心：去背 → 推論 → marching cubes → 匯出。
+    圖片端點與文字端點都走這裡。回傳各段耗時。"""
     timings: dict[str, float] = {}
 
     # 1) 去背 + 置中（Meshy 也是這步先把主體摳乾淨）
@@ -137,13 +158,15 @@ async def generate(
 
     # 4) 匯出 .glb
     t = time.time()
-    glb_path = job_dir / "model.glb"
-    meshes[0].export(str(glb_path))
+    meshes[0].export(str(job_dir / "model.glb"))
     timings["export"] = time.time() - t
 
+    return timings
+
+
+def _glb_response(job_id: str, timings: dict) -> JSONResponse:
     total = sum(timings.values())
     log.info(f"[{job_id}] done in {total:.2f}s {timings}")
-
     return JSONResponse(
         {
             "job_id": job_id,
@@ -153,6 +176,58 @@ async def generate(
             "total_sec": round(total, 3),
         }
     )
+
+
+@app.post("/api/generate")
+async def generate(
+    image: UploadFile = File(...),
+    remove_bg: bool = True,
+) -> JSONResponse:
+    """收一張圖，回傳生成好的 .glb 相對 URL 與耗時。"""
+    if model is None:
+        raise HTTPException(503, "engine still loading, retry shortly")
+
+    try:
+        raw = await image.read()
+        pil = Image.open(io.BytesIO(raw))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"cannot read image: {e}")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    timings = image_to_glb(pil, job_dir, remove_bg=remove_bg)
+    return _glb_response(job_id, timings)
+
+
+@app.post("/api/generate-from-text")
+async def generate_from_text(prompt: str = Form(...)) -> JSONResponse:
+    """打字生 3D：文字 → SDXL-Turbo 生圖 → 沿用同一條 TripoSR 管線 → glb。"""
+    if model is None:
+        raise HTTPException(503, "engine still loading, retry shortly")
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is empty")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 文字 → 圖（SDXL-Turbo）。存下來讓前端也能秀「生成的中間圖」。
+    t = time.time()
+    try:
+        gen_img = text_to_image(prompt)
+    except Exception as e:  # noqa: BLE001
+        log.exception("text_to_image failed")
+        raise HTTPException(500, f"text-to-image failed: {e}")
+    gen_img.save(job_dir / "generated.png")
+    t2i = time.time() - t
+
+    # 2) 生成的圖 → 走現有圖生 3D 管線
+    timings = image_to_glb(gen_img, job_dir, remove_bg=True)
+    timings = {"text2img": t2i, **timings}
+    resp = _glb_response(job_id, timings)
+    return resp
 
 
 # 靜態產物：/outputs/<job>/model.glb 直接讓前端抓
